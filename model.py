@@ -16,10 +16,10 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 import keras_core as keras
-from keras_core.keras.layers import Layer
+from keras_core import Model
+from keras_core import layers
 
-
-class LayerNorm(Layer):
+class LayerNorm(layers.Layer):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
     def __init__(self, ndim, bias):
@@ -33,10 +33,10 @@ class LayerNorm(Layer):
         # self.weight = nn.Parameter(torch.ones(ndim))
         # self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
 
-    def forward(self, input):
-        return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
+    def call(self, input):
+        return layers.LayerNormalization(input, self.weight.shape, self.weight, self.bias, epilepson=1e-5)
 
-class CausalSelfAttention(nn.Module):
+class CausalSelfAttention(layers.Layer):
 
     def __init__(self, config):
         super().__init__()
