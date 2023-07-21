@@ -11,10 +11,6 @@ import math
 import inspect
 from dataclasses import dataclass
 
-import torch
-import torch.nn as nn
-from torch.nn import functional as F
-
 import numpy as np
 
 import keras_core as keras
@@ -188,7 +184,6 @@ class GPT(Model):
         # but want to use a smaller block size for some smaller, simpler model
         assert block_size <= self.config.block_size
         self.config.block_size = block_size
-        self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
         self.transformer.get_layer('wpe').set_weights([ self.transformer.get_layer('wpe').get_weights()[0][:block_size] ])
         for block in self.transformer.h:
             if 'bias' in block.get_weights():

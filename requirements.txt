@@ -1,0 +1,8 @@
+transformers
+datasets
+keras_core
+numpy
+tiktoken
+wandb
+tqdm
+tensorflow
