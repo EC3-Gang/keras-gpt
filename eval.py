@@ -6,18 +6,16 @@ from contextlib import nullcontext
 import numpy as np
 import time
 import keras_core as keras
-from model import GPTConfig, GPT
+from model import GPTConfig, GPT, get_param
 
 # -----------------------------------------------------------------------------
 batch_size = 12
 block_size = 1024
 bias = False
-real_data = True
+real_data = False
 seed = 1337
 device = 'gpu' 
-dtype = 'float16' if device is not 'cpu' else 'float32'
-compile = True # use PyTorch 2.0 to compile the model to be faster
-profile = False # use pytorch profiler, or just simple benchmarking?
+dtype = 'float16' if device != 'cpu' else 'float32'
 exec(open('configurator.py').read()) # overrides from command line or config file
 # -----------------------------------------------------------------------------
 
@@ -34,15 +32,15 @@ if real_data:
     train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
     def get_batch(split):
         data = train_data # note ignore split in benchmarking script
-        ix = np.randint(len(data) - block_size, (batch_size,))
-        x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
-        y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
+        ix = np.random.randint(len(data) - block_size, (batch_size,))
+        x = keras.ops.stack([keras.ops.convert_to_tensor((data[i:i+block_size]).astype(np.int64)) for i in ix])
+        y = keras.ops.stack([keras.ops.convert_to_tensor((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
         x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
         return x, y
 else:
     # alternatively, if fixed data is desired to not care about data loading
-    x = torch.randint(50304, (batch_size, block_size), device=device)
-    y = torch.randint(50304, (batch_size, block_size), device=device)
+    x = keras.ops.convert_to_tensor(np.random.randint(0, 50304, (batch_size, block_size)))
+    y = keras.ops.convert_to_tensor(np.random.randint(0, 50304, (batch_size, block_size)))
     get_batch = lambda split: (x, y)
 
 # model init
@@ -53,63 +51,24 @@ gptconf = GPTConfig(
     bias = bias,
 )
 model = GPT(gptconf)
-model.to(device)
 
 optimizer = model.configure_optimizers(weight_decay=1e-2, learning_rate=1e-4, betas=(0.9, 0.95))
 
-if compile:
-    print("Compiling model...")
-    model = torch.compile(model) # pytorch 2.0
+model.compile(optimizer=optimizer, loss=keras.losses.CategoricalCrossentropy)
+model(np.zeros((batch_size, block_size))) # build the model before using it
 
-if profile:
-    # useful docs on pytorch profiler:
-    # - tutorial https://pytorch.org/tutorials/intermediate/tensorboard_profiler_tutorial.html
-    # - api https://pytorch.org/docs/stable/profiler.html#torch.profiler.profile
-    wait, warmup, active = 5, 5, 5
-    num_steps = wait + warmup + active
-    with torch.profiler.profile(
-        activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
-        schedule=torch.profiler.schedule(wait=wait, warmup=warmup, active=active, repeat=1),
-        on_trace_ready=torch.profiler.tensorboard_trace_handler('./bench_log'),
-        record_shapes=False,
-        profile_memory=False,
-        with_stack=False, # incurs an additional overhead, disable if not needed
-        with_flops=True,
-        with_modules=False, # only for torchscript models atm
-    ) as prof:
+print("Total parameters:", get_param(model))
 
+for stage, num_steps in enumerate([10, 20]): # burnin, then benchmark
+    t0 = time.time()
+    X, Y = get_batch('train')
+    for k in range(num_steps):
         X, Y = get_batch('train')
-        for k in range(num_steps):
-            with ctx:
-                logits, loss = model(X, Y)
-            X, Y = get_batch('train')
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            optimizer.step()
-            lossf = loss.item()
-            print(f"{k}/{num_steps} loss: {lossf:.4f}")
-
-            prof.step() # notify the profiler at end of each step
-
-else:
-
-    # simple benchmarking
-    torch.cuda.synchronize()
-    for stage, num_steps in enumerate([10, 20]): # burnin, then benchmark
-        t0 = time.time()
-        X, Y = get_batch('train')
-        for k in range(num_steps):
-            with ctx:
-                logits, loss = model(X, Y)
-            X, Y = get_batch('train')
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            optimizer.step()
-            lossf = loss.item()
-            print(f"{k}/{num_steps} loss: {lossf:.4f}")
-        torch.cuda.synchronize()
-        t1 = time.time()
-        dt = t1-t0
-        mfu = model.estimate_mfu(batch_size * 1 * num_steps, dt)
-        if stage == 1:
-            print(f"time per iteration: {dt/num_steps*1000:.4f}ms, MFU: {mfu*100:.2f}%")
+        history = model.fit(X, Y, epochs=1, verbose=0)
+        loss = history.history['loss'][0]
+        print(f"{k}/{num_steps} loss: {loss:.4f}")
+    t1 = time.time()
+    dt = t1-t0
+    mfu = model.estimate_mfu(batch_size * 1 * num_steps, dt)
+    if stage == 1:
+        print(f"time per iteration: {dt/num_steps*1000:.4f}ms, MFU: {mfu*100:.2f}%")

@@ -23,6 +23,9 @@ from keras_core import initializers
 from keras_core import losses
 from keras_core import optimizers
 
+def get_param(model):
+    return model.count_params()
+
 def np_multinomial(probs, num_samples=1):
     return np.array([np.random.choice(len(probs), p=probs) for _ in range(num_samples)])
 
@@ -33,21 +36,21 @@ class Inits:
         self.scaled = initializers.RandomNormal(mean=0.0, stddev=0.02/math.sqrt(2 * config.n_layer ))
 
 class LayerNorm(Layer):
-    """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
-
-    def __init__(self, ndim, bias):
+    def __init__(self, ndim, use_bias):
         super().__init__()
+        self.normalize = layers.LayerNormalization(epsilon=1e-6)
         self.weight = self.add_weight(shape=ndim,
                                       initializer='ones',
                                       trainable=True)
         self.bias = self.add_weight(shape=ndim,
                                     initializer='zeroes',
-                                    trainable=True) if bias else None
-        # self.weight = nn.Parameter(torch.ones(ndim))
-        # self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
+                                    trainable=True) if use_bias else None
 
-    def call(self, input):
-        return layers.LayerNormalization(input, self.weight.shape, self.weight, self.bias, epilepson=1e-5)
+    def call(self, inputs):
+        output = self.normalize(inputs)
+        if self.bias is not None:
+            output = output * self.weight + self.bias
+        return output
 
 class CausalSelfAttention(Layer):
     def __init__(self, config, weight_initializer, bias_initializer, scaled_initializer):
@@ -61,43 +64,36 @@ class CausalSelfAttention(Layer):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
+        self.bias = ops.triu(ops.ones((config.block_size, config.block_size)), -1).reshape(1, 1, config.block_size, config.block_size)
 
-    def build(self, input_shape):
-        # Replaced tf.linalg.band_part with keras_core.ops.tril
-        self.bias = (1 - ops.tril(ops.ones((input_shape[1], input_shape[1])))) * -1e9
-        super(CausalSelfAttention, self).build(input_shape)
 
-    def split_heads(self, x, batch_size):
-        x = ops.reshape(x, (batch_size, -1, self.n_head, self.n_embd // self.n_head))
-        return ops.transpose(x, perm=[0, 2, 1, 3])
+    def call(self, x):
+        B, T, C = x.shape
 
-    def call(self, inputs):
-        batch_size = inputs.shape[0]
-        q, k, v = ops.split(self.c_attn(inputs), 3, axis=2)
-        q = self.split_heads(q, batch_size)
-        k = self.split_heads(k, batch_size)
-        v = self.split_heads(v, batch_size)
+        qkv = self.c_attn(x)
+        q, k, v = ops.split(qkv, indices_or_sections=3, axis=2)
+        k = ops.transpose(ops.reshape(k, (B, T, self.n_head, C // self.n_head)), (0, 2, 1, 3)) # (B, nh, T, hs)
+        q = ops.transpose(ops.reshape(q, (B, T, self.n_head, C // self.n_head)), (0, 2, 1, 3)) # (B, nh, T, hs)
+        v = ops.transpose(ops.reshape(v, (B, T, self.n_head, C // self.n_head)), (0, 2, 1, 3)) # (B, nh, T, hs)
+        att = ops.matmul(q, ops.transpose(k, axes=(0, 1, -1, -2))) * (1.0 / ops.sqrt(ops.size(k[-1])))
+        att = ops.where(ops.expand_dims(ops.expand_dims(self.bias[:, :, :T, :T], axis=0), axis=1) == 0, float("-inf"), att)
+        att = ops.softmax(att, axis=-1)
+        att = self.attn_dropout(att)
+        y = ops.matmul(att, v)  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        y = ops.transpose(y, axes=(0, 2, 1, 3, 4, 5))
+        y = ops.reshape(y, (B, T, C))
 
-        attn = ops.matmul(q, k, transpose_b=True)
-        attn = attn / np.sqrt(float(k.shape[-1]))
-        attn = attn + self.bias
-        attn = activations.softmax(attn, axis=-1)
-        attn = self.attn_dropout(attn)
+        y = self.c_proj(y)
+        return y
 
-        out = ops.matmul(attn, v)
-        out = ops.transpose(out, perm=[0, 2, 1, 3])
-        out = ops.reshape(out, (batch_size, -1, self.n_embd))
-
-        out = self.resid_dropout(self.c_proj(out))
-        return out
 
 class MLP(Layer):
 
     def __init__(self, config, weight_initializer, bias_initializer, scaled_initializer):
         super().__init__()
-        self.c_fc    = layers.Dense(4 * config.n_embd, bias=config.bias, kernel_initializer=weight_initializer, bias_initializer=bias_initializer)
-        self.gelu    = ops.gelu()
-        self.c_proj  = layers.Dense(config.n_embd, bias=config.bias, kernel_initializer=scaled_initializer, bias_initializer=bias_initializer)
+        self.c_fc    = layers.Dense(4 * config.n_embd, use_bias=config.bias, kernel_initializer=weight_initializer, bias_initializer=bias_initializer)
+        self.gelu    = ops.gelu
+        self.c_proj  = layers.Dense(config.n_embd, use_bias=config.bias, kernel_initializer=scaled_initializer, bias_initializer=bias_initializer)
         self.dropout = layers.Dropout(config.dropout)
 
     def call(self, x):
@@ -111,9 +107,9 @@ class Block(Layer):
 
     def __init__(self, config, weight_initializer, bias_initializer, scaled_initializer):
         super().__init__()
-        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+        self.ln_1 = LayerNorm(config.n_embd, use_bias=config.bias)
         self.attn = CausalSelfAttention(config, weight_initializer=weight_initializer, bias_initializer=bias_initializer, scaled_initializer=scaled_initializer)
-        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
+        self.ln_2 = LayerNorm(config.n_embd, use_bias=config.bias)
         self.mlp = MLP(config, weight_initializer=weight_initializer, bias_initializer=bias_initializer, scaled_initializer=scaled_initializer)
 
     def call(self, x):
@@ -137,8 +133,8 @@ class Transformer(Layer):
         self.wte = layers.Embedding(config.vocab_size, config.n_embd, embeddings_initializer=weight_initializer)
         self.wpe = layers.Embedding(config.block_size, config.n_embd)
         self.drop = layers.Dropout(config.dropout)
-        self.h = keras.Sequential([Block(config, weight_initializer=weight_initializer, bias_initializer=bias_initializer, scaled_initializer=scaled_initializer) for _ in range(config.n_layer)])
-        self.ln_f = LayerNorm(config.n_embd, bias=config.bias)
+        self.h = [Block(config, weight_initializer=weight_initializer, bias_initializer=bias_initializer, scaled_initializer=scaled_initializer) for _ in range(config.n_layer)]
+        self.ln_f = LayerNorm(config.n_embd, use_bias=config.bias)
 
 class GPT(Model):
 
@@ -147,13 +143,15 @@ class GPT(Model):
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.init = Inits(config)
+        self.config = config
         self.transformer = Transformer(config, weight_initializer=self.init.weight, bias_initializer=self.init.bias, scaled_initializer=self.init.scaled)
-        self.lm_head = layers.Dense(config.vocab_size, bias=False, kernel_initializer=self.init.weight, bias_initializer=self.init.bias)
-        self.transformer.embeddings.set_weights(self.lm_head.get_weights()) # https://paperswithcode.com/method/weight-tying
+        self.lm_head = layers.Dense(config.vocab_size, use_bias=False, kernel_initializer=self.init.weight, bias_initializer=self.init.bias)
+        for emb in self.get_layers(layers.Embedding):
+            emb.set_weights(self.lm_head.get_weights()) # https://paperswithcode.com/method/weight-tying
 
-        # report number of parameters
-        print("number of parameters: %.2fM" % (self.count_params()/1e6,))
-
+    def get_layers(self, layer_type):
+        layers = [layer for layer in self.layers if isinstance(layer, layer_type)]
+        return layers
     def call(self, idx, targets=None):
         b, t = idx.shape[0], idx.shape[1]
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
