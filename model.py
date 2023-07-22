@@ -76,7 +76,7 @@ class CausalSelfAttention(Layer):
         q = ops.transpose(ops.reshape(q, (B, T, self.n_head, C // self.n_head)), (0, 2, 1, 3)) # (B, nh, T, hs)
         v = ops.transpose(ops.reshape(v, (B, T, self.n_head, C // self.n_head)), (0, 2, 1, 3)) # (B, nh, T, hs)
         att = ops.matmul(q, ops.transpose(k, axes=(0, 1, -1, -2))) * (1.0 / ops.sqrt(ops.size(k[-1])))
-        att = ops.where(ops.expand_dims(ops.expand_dims(self.bias[:, :, :T, :T], axis=0), axis=1) == 0, float("-inf"), att)
+        att = ops.where(ops.expand_dims(ops.expand_dims(self.bias[:, :, :T, :T], axis=0), axis=1) == 0, ops.cast("-inf", dtype='float32'), att)
         att = ops.softmax(att, axis=-1)
         att = self.attn_dropout(att)
         y = ops.matmul(att, v)  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
