@@ -20,7 +20,6 @@ exec(open('configurator.py').read()) # overrides from command line or config fil
 # -----------------------------------------------------------------------------
 
 keras.utils.set_random_seed(seed)
-device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
 
 if device == 'gpu':
     keras.mixed_precision.set_dtype_policy(dtype)
