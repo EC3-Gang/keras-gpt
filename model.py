@@ -64,7 +64,7 @@ class CausalSelfAttention(Layer):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
-        self.bias = ops.triu(ops.ones((config.block_size, config.block_size)), -1).reshape(1, 1, config.block_size, config.block_size)
+        self.bias = ops.reshape(ops.triu(ops.ones((config.block_size, config.block_size)), -1),(1, 1, config.block_size, config.block_size))
 
 
     def call(self, x):
